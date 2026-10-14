@@ -1,10 +1,14 @@
+import asyncio
 import base64
 import hashlib
+import json
 import logging
 import os
 import re
-from collections import defaultdict, deque
+import ssl
+from urllib.parse import parse_qs, unquote, urlparse
 
+import pg8000.native
 from chatgpt_md_converter import split_html_for_telegram, telegram_format
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -25,6 +29,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.environ["telegram_token"].strip()
 OPENROUTER_KEY = os.environ["open_router_key"].strip()
 GEMINI_KEY = os.environ.get("gemini_key", "").strip()
+DATABASE_URL = os.environ.get("database_url", "").strip()
 SYSTEM_PROMPT = """You are a helpful, friendly assistant chatting on Telegram.
 
 Format replies so they look great in a Telegram chat, using Markdown:
@@ -66,26 +71,90 @@ MODELS = {
 MODELS = {k: v for k, v in MODELS.items() if v[1] in clients}  # hide models without a key
 DEFAULT_MODEL = "ling"
 
-histories: dict[int, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
-chat_models: dict[int, str] = {}
+class ChatStore:
+    """Per-chat model choice and history: saved in Postgres when database_url is set, else kept in memory."""
+
+    def __init__(self, url: str):
+        self.url = urlparse(url) if url else None
+        self.memory: dict[int, dict] = {}
+
+    def _run(self, sql: str, **params):
+        # A short-lived connection per query: simple, and survives the database suspending when idle.
+        u = self.url
+        sslmode = parse_qs(u.query).get("sslmode", ["require"])[0]
+        con = pg8000.native.Connection(
+            user=unquote(u.username or ""),
+            password=unquote(u.password or ""),
+            host=u.hostname,
+            port=u.port or 5432,
+            database=u.path.lstrip("/") or "postgres",
+            ssl_context=None if sslmode == "disable" else ssl.create_default_context(),
+            timeout=30,
+        )
+        try:
+            return con.run(sql, **params)
+        finally:
+            con.close()
+
+    async def init(self) -> None:
+        if not self.url:
+            log.warning("database_url not set: chat history is kept in memory and lost on restart")
+            return
+        await asyncio.to_thread(
+            self._run,
+            "CREATE TABLE IF NOT EXISTS chats ("
+            " chat_id BIGINT PRIMARY KEY,"
+            " model TEXT,"
+            " history JSONB NOT NULL DEFAULT '[]',"
+            " updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+        )
+        log.info("Chat history is saved in Postgres (%s)", self.url.hostname)
+
+    async def load(self, chat_id: int) -> dict:
+        if not self.url:
+            return self.memory.get(chat_id) or {"model": None, "history": []}
+        rows = await asyncio.to_thread(self._run, "SELECT model, history FROM chats WHERE chat_id = :id", id=chat_id)
+        return {"model": rows[0][0], "history": rows[0][1]} if rows else {"model": None, "history": []}
+
+    async def save(self, chat_id: int, state: dict) -> None:
+        state = {"model": state["model"], "history": state["history"][-MAX_HISTORY:]}
+        if not self.url:
+            self.memory[chat_id] = state
+            return
+        await asyncio.to_thread(
+            self._run,
+            "INSERT INTO chats (chat_id, model, history) VALUES (:id, :model, CAST(:history AS JSONB))"
+            " ON CONFLICT (chat_id) DO UPDATE"
+            " SET model = EXCLUDED.model, history = EXCLUDED.history, updated_at = now()",
+            id=chat_id,
+            model=state["model"],
+            history=json.dumps(state["history"]),
+        )
 
 
-def current_model(chat_id: int) -> str:
-    return chat_models.get(chat_id, DEFAULT_MODEL)
+store = ChatStore(DATABASE_URL)
+
+
+def model_key(state: dict) -> str:
+    return state["model"] if state["model"] in MODELS else DEFAULT_MODEL
 
 
 async def ask_model(chat_id: int, user_content) -> str:
-    _, provider, model_id = MODELS[current_model(chat_id)]
-    history = histories[chat_id]
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": user_content}]
+    state = await store.load(chat_id)
+    _, provider, model_id = MODELS[model_key(state)]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *state["history"], {"role": "user", "content": user_content}]
     resp = await clients[provider].chat.completions.create(model=model_id, messages=messages)
     reply = (resp.choices[0].message.content or "").strip() or "(empty response)"
     # Store images as a text placeholder so history stays small.
     if isinstance(user_content, list):
         text = next((p["text"] for p in user_content if p["type"] == "text"), "")
         user_content = f"[sent an image] {text}".strip()
-    history.append({"role": "user", "content": user_content})
-    history.append({"role": "assistant", "content": reply})
+    state["history"] = [
+        *state["history"],
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": reply},
+    ]
+    await store.save(chat_id, state)
     return reply
 
 
@@ -150,8 +219,7 @@ async def send_long(update: Update, text: str) -> None:
         await update.message.reply_text(text[i : i + TELEGRAM_MSG_LIMIT])
 
 
-def model_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    selected = current_model(chat_id)
+def model_keyboard(selected: str) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(("✅ " if key == selected else "") + label, callback_data=f"model:{key}")]
         for key, (label, _, _) in MODELS.items()
@@ -160,7 +228,8 @@ def model_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    label = MODELS[current_model(update.effective_chat.id)][0]
+    state = await store.load(update.effective_chat.id)
+    label = MODELS[model_key(state)][0]
     await update.message.reply_text(
         f"Hi! I'm currently using {label}. Send me a message or a photo.\n"
         "/model switches the AI model\n/reset clears our conversation."
@@ -168,12 +237,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    histories.pop(update.effective_chat.id, None)
+    chat_id = update.effective_chat.id
+    state = await store.load(chat_id)
+    await store.save(chat_id, {"model": state["model"], "history": []})
     await update.message.reply_text("Conversation cleared.")
 
 
 async def choose_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Choose a model:", reply_markup=model_keyboard(update.effective_chat.id))
+    state = await store.load(update.effective_chat.id)
+    await update.message.reply_text("Choose a model:", reply_markup=model_keyboard(model_key(state)))
 
 
 async def model_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -183,10 +255,11 @@ async def model_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("That model is no longer available.")
         return
     chat_id = update.effective_chat.id
-    chat_models[chat_id] = key
+    state = await store.load(chat_id)
+    await store.save(chat_id, {"model": key, "history": state["history"]})
     label = MODELS[key][0]
     await query.answer(f"Switched to {label}")
-    await query.edit_message_text(f"Now using {label}.", reply_markup=model_keyboard(chat_id))
+    await query.edit_message_text(f"Now using {label}.", reply_markup=model_keyboard(key))
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -219,6 +292,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def post_init(app: Application) -> None:
+    await store.init()
     # Populates the command menu next to the chat input box.
     await app.bot.set_my_commands(
         [
