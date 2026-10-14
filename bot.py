@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import logging
 import os
 import re
@@ -247,7 +248,22 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     log.info("Bot running. Models: %s", ", ".join(label for label, _, _ in MODELS.values()))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # On Render (or any host that sets a public URL) use a webhook; locally, poll.
+    public_url = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+    if public_url:
+        # Secret path + header derived from the token, so only Telegram can post updates.
+        secret = hashlib.sha256(TELEGRAM_TOKEN.encode()).hexdigest()[:32]
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.environ.get("PORT", 10000)),
+            url_path=secret,
+            webhook_url=f"{public_url.rstrip('/')}/{secret}",
+            secret_token=secret,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

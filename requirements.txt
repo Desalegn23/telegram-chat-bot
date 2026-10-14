@@ -1,4 +1,4 @@
-python-telegram-bot>=21.0
+python-telegram-bot[webhooks]>=21.0
 openai>=1.40
 python-dotenv>=1.0
 chatgpt-md-converter>=0.3.12
