@@ -12,8 +12,8 @@ import pg8000.native
 from chatgpt_md_converter import split_html_for_telegram, telegram_format
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction, ParseMode
+from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity, Update
+from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -41,6 +41,9 @@ Format replies so they look great in a Telegram chat, using Markdown:
 - Use a few relevant emojis to make sections easy to scan, but don't overdo it.
 - Keep tables small (they are shown as monospace text); prefer lists when possible.
 Keep paragraphs short. Match length to the question: brief for simple questions, structured for complex ones."""
+GROUP_PROMPT = """
+
+You are in a Telegram group chat. Each message starts with the sender's name in [brackets], and several people may be talking. You only see messages that mention you or reply to you. Keep replies brief and address people by name, but never start your reply with a [name] tag."""
 MAX_HISTORY = 20  # messages kept per chat (user + assistant)
 TELEGRAM_MSG_LIMIT = 4096
 REQUEST_TIMEOUT = 90  # seconds per model request
@@ -139,12 +142,16 @@ def model_key(state: dict) -> str:
     return state["model"] if state["model"] in MODELS else DEFAULT_MODEL
 
 
-async def ask_model(chat_id: int, user_content) -> str:
+async def ask_model(chat_id: int, user_content, group: bool = False) -> str:
     state = await store.load(chat_id)
     _, provider, model_id = MODELS[model_key(state)]
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *state["history"], {"role": "user", "content": user_content}]
+    system = SYSTEM_PROMPT + (GROUP_PROMPT if group else "")
+    messages = [{"role": "system", "content": system}, *state["history"], {"role": "user", "content": user_content}]
     resp = await clients[provider].chat.completions.create(model=model_id, messages=messages)
-    reply = (resp.choices[0].message.content or "").strip() or "(empty response)"
+    reply = (resp.choices[0].message.content or "").strip()
+    if group:
+        reply = re.sub(r"^\[[^\]\n]{1,64}\]:?\s*", "", reply)  # models sometimes echo the [name] tag
+    reply = reply or "(empty response)"
     # Store images as a text placeholder so history stays small.
     if isinstance(user_content, list):
         text = next((p["text"] for p in user_content if p["type"] == "text"), "")
@@ -262,11 +269,44 @@ async def model_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.edit_message_text(f"Now using {label}.", reply_markup=model_keyboard(key))
 
 
+def is_group(update: Update) -> bool:
+    return update.effective_chat.type != ChatType.PRIVATE
+
+
+def addressed_to_bot(message: Message, bot: Bot) -> bool:
+    """In groups, only messages that @mention the bot or reply to it count. Private chats always count."""
+    if message.chat.type == ChatType.PRIVATE:
+        return True
+    replied = message.reply_to_message
+    if replied and replied.from_user and replied.from_user.id == bot.id:
+        return True
+    kinds = [MessageEntity.MENTION, MessageEntity.TEXT_MENTION]
+    entities = {**message.parse_entities(kinds), **message.parse_caption_entities(kinds)}
+    return any(
+        (e.type == MessageEntity.MENTION and text.lower() == f"@{bot.username}".lower())
+        or (e.type == MessageEntity.TEXT_MENTION and e.user and e.user.id == bot.id)
+        for e, text in entities.items()
+    )
+
+
+def group_message_text(update: Update, bot: Bot, text: str | None) -> str:
+    """Remove the bot's @mention and, in groups, prefix the sender's name so the model knows who is talking."""
+    text = re.sub(rf"@{re.escape(bot.username)}\b", "", text or "", flags=re.I).strip()
+    if not is_group(update):
+        return text
+    name = update.effective_user.first_name if update.effective_user else "Someone"
+    return f"[{name}]: {text or '(mentioned you without a message)'}"
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not addressed_to_bot(update.message, context.bot):
+        return
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
     try:
-        reply = await ask_model(chat_id, update.message.text)
+        reply = await ask_model(
+            chat_id, group_message_text(update, context.bot, update.message.text), group=is_group(update)
+        )
     except Exception:
         log.exception("Model request failed")
         reply = "Sorry, something went wrong talking to the model. Try again, or pick another one with /model."
@@ -274,17 +314,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not addressed_to_bot(update.message, context.bot):
+        return
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
     try:
         photo_file = await update.message.photo[-1].get_file()  # largest size
         data = await photo_file.download_as_bytearray()
         b64 = base64.b64encode(bytes(data)).decode()
+        caption = group_message_text(update, context.bot, update.message.caption)
         content = [
-            {"type": "text", "text": update.message.caption or "Describe this image."},
+            {"type": "text", "text": caption or "Describe this image."},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
         ]
-        reply = await ask_model(chat_id, content)
+        reply = await ask_model(chat_id, content, group=is_group(update))
     except Exception:
         log.exception("Image request failed")
         reply = "Sorry, I couldn't process that image. Try again, or pick another model with /model."
