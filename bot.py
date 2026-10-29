@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import pg8000.native
 from chatgpt_md_converter import split_html_for_telegram, telegram_format
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from openai import APIError, AsyncOpenAI
 from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity, Update
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest
@@ -46,7 +46,7 @@ GROUP_PROMPT = """
 You are in a Telegram group chat. Each message starts with the sender's name in [brackets], and several people may be talking. You only see messages that mention you or reply to you. Keep replies brief and address people by name, but never start your reply with a [name] tag."""
 MAX_HISTORY = 20  # messages kept per chat (user + assistant)
 TELEGRAM_MSG_LIMIT = 4096
-REQUEST_TIMEOUT = 90  # seconds per model request
+REQUEST_TIMEOUT = 40  # seconds per model request; on failure we fall back to another model instead of retrying
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -55,7 +55,7 @@ log = logging.getLogger("bot")
 # One OpenAI-compatible client per provider.
 clients = {
     "openrouter": AsyncOpenAI(
-        base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_KEY, timeout=REQUEST_TIMEOUT
+        base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_KEY, timeout=REQUEST_TIMEOUT, max_retries=0
     ),
 }
 if GEMINI_KEY:
@@ -63,16 +63,19 @@ if GEMINI_KEY:
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         api_key=GEMINI_KEY,
         timeout=REQUEST_TIMEOUT,
+        max_retries=0,
     )
 
 # key -> (button label, provider, model id)
+# Listed in fallback order: Gemini first, since it handles Amharic far better than Ling. Flash-Lite leads
+# because Gemini 3.8 Flash is often overloaded and makes customers wait for a timeout.
 MODELS = {
-    "ling": ("Ling 3.0 Flash VL", "openrouter", "inclusionai/ling-3.0-flash-vl"),
-    "gemini-flash": ("Gemini 3.8 Flash", "gemini", "gemini-3.8-flash"),
     "gemini-lite": ("Gemini 3.5 Flash-Lite", "gemini", "gemini-3.5-flash-lite"),
+    "gemini-flash": ("Gemini 3.8 Flash", "gemini", "gemini-3.8-flash"),
+    "ling": ("Ling 3.0 Flash VL", "openrouter", "inclusionai/ling-3.0-flash-vl"),
 }
 MODELS = {k: v for k, v in MODELS.items() if v[1] in clients}  # hide models without a key
-DEFAULT_MODEL = "ling"
+DEFAULT_MODEL = next(iter(MODELS))  # Gemini 3.5 Flash-Lite when a Gemini key is set
 
 class ChatStore:
     """Per-chat model choice and history: saved in Postgres when database_url is set, else kept in memory."""
@@ -142,13 +145,30 @@ def model_key(state: dict) -> str:
     return state["model"] if state["model"] in MODELS else DEFAULT_MODEL
 
 
+async def complete_with_fallback(selected: str, messages: list) -> str:
+    """Ask the selected model; if it's overloaded, down or returns nothing, try the others in MODELS order."""
+    candidates = [selected, *(k for k in MODELS if k != selected)]
+    for i, key in enumerate(candidates):
+        _, provider, model_id = MODELS[key]
+        last = i == len(candidates) - 1
+        try:
+            resp = await clients[provider].chat.completions.create(model=model_id, messages=messages)
+        except APIError as e:
+            if last:
+                raise
+            log.warning("%s failed (%s); falling back to %s", MODELS[key][0], e.__class__.__name__, MODELS[candidates[i + 1]][0])
+            continue
+        reply = (resp.choices[0].message.content or "").strip()
+        if reply or last:
+            return reply
+        log.warning("%s returned an empty reply; falling back to %s", MODELS[key][0], MODELS[candidates[i + 1]][0])
+
+
 async def ask_model(chat_id: int, user_content, group: bool = False) -> str:
     state = await store.load(chat_id)
-    _, provider, model_id = MODELS[model_key(state)]
     system = SYSTEM_PROMPT + (GROUP_PROMPT if group else "")
     messages = [{"role": "system", "content": system}, *state["history"], {"role": "user", "content": user_content}]
-    resp = await clients[provider].chat.completions.create(model=model_id, messages=messages)
-    reply = (resp.choices[0].message.content or "").strip()
+    reply = await complete_with_fallback(model_key(state), messages)
     if group:
         reply = re.sub(r"^\[[^\]\n]{1,64}\]:?\s*", "", reply)  # models sometimes echo the [name] tag
     reply = reply or "(empty response)"
